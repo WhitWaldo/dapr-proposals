@@ -14,7 +14,7 @@ Downstream enhancements are deferred to separate proposals.
 ## Background
 
 ### Motivation
-The Conversation building block landed with the model named in the component, which was a sensible choice when the supported providers each exposed only a handful of models. As the provider set has grown, the most common request I've seen (both in Discord and in person) has been a way to choose the model without standing up a near-duplicate component for each one. That pressure is only increasing: Ollama already supports 100+ models and a provider like OpenRouter (120+) would make a component-per-model approach impractical for an infrastructure team to reasonably maintain.
+The Conversation building block landed with the model named in the component, which was a sensible choice when the supported providers each exposed only a handful of models. As the provider set has grown, the most common request I've seen (both in Discord and in person) has been a way to choose the model without standing up a near-duplicate component for each one. That pressure is only increasing: Ollama already supports 100+ models and a provider like OpenRouter (400+) would make a component-per-model approach impractical for an infrastructure team to reasonably maintain.
 
 One natural response is to let the request override the component's model. I don't think this is the right direction. Overrides raise their own questions about which properties are overridable, who owns a connection whose values can change at runtime, and how Dapr functionality layered on top (caching, for example) behaves when they do. Rather than answer those, I think the cleaner move is to reconsider where the model belongs in the first place.
 
