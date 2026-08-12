@@ -163,7 +163,7 @@ following:
 // Existing Dapr service
 service Dapr {
     rpc SetBinaryFileAlpha1(stream SetBinaryFileRequest) returns (SetBinaryFileResponse) {};
-    rpc GetBinaryFileAlpha1(GetBinarFileRequest) returns (stream GetBinaryFileResponse);
+    rpc GetBinaryFileAlpha1(GetBinaryFileRequest) returns (stream GetBinaryFileResponse);
     rpc DeleteBinaryFileAlpha1(DeleteBinaryFileRequest) returns (DeleteBinaryFileResponse) {};
 }
 
