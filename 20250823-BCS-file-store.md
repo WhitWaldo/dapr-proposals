@@ -292,6 +292,14 @@ by activities in later operations.
 This will improve workflow performance by keeping large data out of the event source log in both the 
 inputs and outputs of the workflows and their activities.
 
+### Future Ideas
+This block will be introduced as an alpha release. We can decide if there are some elements that should be added to it after
+the release that warrant inclusion (though ideally not because of a nice-to-have, risking the current state block kitchen 
+sink issues, but must-have). Here are a few such proposals:
+
+1) Etags/Conditional writes
+2) Optional filename prefix
+
 ### Why doesn't it support [awesome-feature-X]?
 This is intended as a provider-agnostic, lean building block that provides a simple mechanism to store binary data
 in a streaming fashion that's generally too large for a key/value store.
