@@ -2,10 +2,15 @@
 - Author(s): @WhitWaldo
 - Significantly inspired by: @ItalyPaleAle (https://github.com/dapr/proposals/pull/18), @artursouza (https://github.com/dapr/dapr/issues/4804)
 - Name inspired by @olitomlinson
-- Updated August 23, 2025
+- Updated October 14, 2026
+
+> **Implementation status:** This proposal reflects the implementation in
+> [dapr/dapr#10367](https://github.com/dapr/dapr/pull/10367),
+> [dapr/components-contrib#4559](https://github.com/dapr/components-contrib/pull/4559), and
+> [dapr/components-contrib#4637](https://github.com/dapr/components-contrib/pull/4637).
 
 ## Overview
-This is a design proposal for building a new [specialized state store](https://github.com/dapr/dapr/issues/7339) for 
+This is a design proposal for building a new [specialized state store](https://github.com/dapr/dapr/issues/7339) for
 managing named files in state providers. I intentionally use the word "file" as opposed to blob or object as to avoid 
 any of the overloaded meaning associated with common object store or blob store providers. I think there's every 
 possibility that it'll make sense to introduce a proper "blob store" or "object store" building block in the future. 
@@ -46,11 +51,27 @@ kind: Component
 metadata:
   name: binarystore
 spec:
-  type: state.binarystore.<providerName>
-  version: v1.0 # Following the API versioning convention proposed in https://github.com/dapr/proposals/pull/87
+  type: binarystore.<providerName>
+  version: v1
   metadata:
-    # Various properties necessary for component registration
+    - name: prefix
+      value: my-prefix
+    # Other properties necessary for component registration
 ```
+
+The initial implementation includes the following component types:
+
+- `binarystore.in-memory`
+- `binarystore.aws.s3`
+- `binarystore.azure.blobstorage`
+- `binarystore.azure.datalake`
+- `binarystore.gcp.bucket`
+- `binarystore.oci.objectstorage`
+
+All initial providers support an optional component-level `prefix` that is prepended to file names. Cloud providers
+also expose an optional `partSize` metadata property, defaulting to `16Mi`, to balance request overhead, maximum
+object size and memory used by each in-flight upload. The in-memory provider instead exposes `maxSize` (default
+`4Mi`) and `maxTotalSize` (default `512Mi`) to bound both individual files and total memory consumption.
 
 ## Implementation Overview
 As touched on above, there are a few guiding principles I want to carry through from previous iterations of this 
@@ -58,6 +79,32 @@ concept:
 - All operations should be asynchronously performed with the sidecar
 - When persisting or retrieving state, this should be done using an asynchronous stream to maximize SDK and runtime
 performance while minimizing resource overhead and preventing memory exhaustion
+
+The implemented component contract exposes `Init`, `Features`, `Set`, `Get`, `Delete`, `GetComponentMetadata` and
+`Close`. `Set` receives an
+`io.Reader`, while `Get` returns an `io.ReadCloser`, allowing data to be transferred without buffering the entire file
+in either the runtime or component. `Set` and `Get` do not use runtime retries, circuit breakers or per-call resiliency
+timeouts because their streams cannot be replayed and a timeout would bound the entire transfer. `Delete` continues
+to use the configured component resiliency policy.
+
+To prevent an endless or oversized upload from exhausting sidecar or component memory, each provider stops reading
+when its configured or service-specific maximum is exceeded and returns a file-too-large error. The runtime maps this
+to HTTP `413 Payload Too Large` or gRPC `RESOURCE_EXHAUSTED`. The in-memory provider additionally returns a store-full
+error, mapped to HTTP `507 Insufficient Storage` or gRPC `RESOURCE_EXHAUSTED`, when accepting an upload would exceed
+`maxTotalSize`. The HTTP upload endpoints opt out of Dapr's global request-body size limit (`SkipRequestBodySizeLimit`)
+so legitimate large files can be streamed; the exemption is matched by route and only applies to endpoints permitted by
+the API allowlist/denylist, so a denied endpoint cannot be used to bypass the limit. Provider limits remain in force.
+
+Provider limits in the initial implementation are:
+
+| Provider | Upload limit behavior |
+| --- | --- |
+| In-memory | Configurable `maxSize` per file and `maxTotalSize` across stored and in-flight data |
+| AWS S3 | Lesser of 50 TB or 10,000 configured-size parts; `partSize` must be 5 MiB-5 GiB |
+| Azure Blob Storage | 50,000 configured-size blocks; `partSize` must be 1 byte-4000 MiB |
+| Azure Data Lake Storage Gen2 | 5 TB; `partSize` must be 1 byte-4000 MiB |
+| Google Cloud Storage | 5 TiB; `partSize` must be a positive multiple of 256 KiB |
+| OCI Object Storage | Lesser of 10 TiB or 10,000 configured-size parts; `partSize` must be 10 MiB-50 GiB |
 
 ### Make Runtime APIs Simpler
 I'd like to make the runtime APIs as simple as possible so they're more readily used in a composable way alongside other
@@ -162,81 +209,92 @@ following:
 ```proto
 // Existing Dapr service
 service Dapr {
-    rpc SetBinaryFileAlpha1(stream SetBinaryFileRequest) returns (SetBinaryFileResponse) {};
-    rpc GetBinaryFileAlpha1(GetBinaryFileRequest) returns (stream GetBinaryFileResponse);
-    rpc DeleteBinaryFileAlpha1(DeleteBinaryFileRequest) returns (DeleteBinaryFileResponse) {};
+    rpc SetBinaryFileAlpha1(stream SetBinaryFileRequestAlpha1) returns (SetBinaryFileResponseAlpha1) {}
+    rpc GetBinaryFileAlpha1(GetBinaryFileRequestAlpha1) returns (stream GetBinaryFileResponseAlpha1) {}
+    rpc DeleteBinaryFileAlpha1(DeleteBinaryFileRequestAlpha1) returns (DeleteBinaryFileResponseAlpha1) {}
 }
 
-message SetBinaryFileRequest {
-    // Request details. Must be present in the first message only.
-    SetBinaryRequestOptions options = 1;
-    // Chunk of data of arbitrary size
-    common.v1.StreamPayload payload = 2;
+message SetBinaryFileRequestAlpha1 {
+    oneof set_binary_file_request_type {
+        // Must be present in the first message only.
+        SetBinaryFileRequestInitialAlpha1 initial_request = 1;
+        // Chunk of data of arbitrary size.
+        common.v1.StreamPayload payload = 2;
+    }
 }
 
-message SetBinaryFileRequestOptions {
+message SetBinaryFileRequestInitialAlpha1 {
     string component_name = 1 [json_name="componentName"];
     string file_name = 2 [json_name="fileName"];
-    bool overwrite = 3 [json_name="overwrite"];
+    optional bool overwrite = 3 [json_name="overwrite"];
 }
 
-// The response for SetBinaryFileAlpha1
-message SetBinaryFileResponse {}
+message SetBinaryFileResponseAlpha1 {}
 
-message GetBinaryFileRequest {
+message GetBinaryFileRequestAlpha1 {
     string component_name = 1 [json_name="componentName"];
     string file_name = 2 [json_name="fileName"];
 }
 
-// The response for GetBinaryFileAlpha1
-message GetBinaryFileResponse {
-    // Chunk of data
+message GetBinaryFileResponseAlpha1 {
     common.v1.StreamPayload payload = 1;
 }
 
-message DeleteBinaryFileRequest {
+message DeleteBinaryFileRequestAlpha1 {
     string component_name = 1 [json_name="componentName"];
     string file_name = 2 [json_name="fileName"];
 }
 
-// The response for DeleteBinaryFileAlpha1
-message DeleteBinaryFileResponse {}
+message DeleteBinaryFileResponseAlpha1 {}
 ```
+
+For `SetBinaryFileAlpha1`, the first message must contain `initial_request`; subsequent payload messages use
+contiguous sequence numbers beginning at zero. The runtime waits up to five seconds for the first message and
+rejects another initial request later in the stream. `overwrite` defaults to `false`, matching POST/create-only
+semantics. Retrieval responses are emitted in 32 KiB payload chunks with contiguous sequence numbers.
+
+File names may contain slash-delimited path segments, but must not be empty, begin or end with `/`, contain `//`, use
+`.` or `..` as a segment, or contain `\`, `*`, `?`, `[`, `]` or `#`. HTTP callers must percent-encode a slash that is
+part of the `{fileName}` route value.
 
 ### HTTP APIs
 
 #### Persist the binary data whether it already exists or not
 ##### Request
-PUT `http://localhost:{daprPort}/v1.0-alpha1/state/binarystore/{componentName}/{fileName}`
+PUT `http://localhost:{daprPort}/v1.0-alpha1/binarystore/{componentName}/{fileName}`
 
-The request body should contain an array of (nominally UTF-8 encoded) bytes.
+The request body contains arbitrary binary data and is streamed to the component.
 
 ##### Response
 | Code | Description                                                                 |
 | ---- |-----------------------------------------------------------------------------|
-| 200 | Binary data successfully persisted                                          |
-| 400 | Binary store provider not found                                             |
+| 204 | Binary data successfully persisted                                          |
+| 400 | Binary store component not found or file name is invalid                    |
+| 413 | File exceeds the maximum size supported or configured by the provider       |
+| 507 | Store does not have enough configured capacity for the file                 |
 | 500 | Request formatted correctly, but error in Dapr code or underlying component | 
 
 
 #### Persist the binary data only if it doesn't already exist with the given name
 ##### Request
-POST `http://localhost:{daprPort}/v1.0-alpha1/state/binarystore/{componentName}/{fileName}`
+POST `http://localhost:{daprPort}/v1.0-alpha1/binarystore/{componentName}/{fileName}`
 
-The request body should contain an array of (nominally UTF-8 encoded) bytes.
+The request body contains arbitrary binary data and is streamed to the component.
 
 ##### Response
 | Code | Description                                                                 |
 | ---- |-----------------------------------------------------------------------------|
-| 200 | Binary data successfully persisted                                          |
-| 400 | Binary store provider not found                                             |
+| 204 | Binary data successfully persisted                                          |
+| 400 | Binary store component not found or file name is invalid                    |
 | 409 | File already exists                                                         |
+| 413 | File exceeds the maximum size supported or configured by the provider       |
+| 507 | Store does not have enough configured capacity for the file                 |
 | 500 | Request formatted correctly, but error in Dapr code or underlying component |
 
 
 #### Retrieve the binary data
 ##### Request
-GET `http://localhost:{daprPort}/v1.0-alpha1/state/binarystore/{componentName}/{fileName}`
+GET `http://localhost:{daprPort}/v1.0-alpha1/binarystore/{componentName}/{fileName}`
 
 ##### Response
 The response to a retrieval request will have its content type header set to `application/octet-stream` as it
@@ -245,20 +303,20 @@ returns an array of bytes representing the binary file data.
 | Code | Description                                                                 |
 | ---- |-----------------------------------------------------------------------------|
 | 200 | Binary data successfully retrieved                                          |
-| 400 | Binary store provider not found                                             |
+| 400 | Binary store component not found or file name is invalid                    |
 | 404 | File not found                                                              |
 | 500 | Request formatted correctly, but error in Dapr code or underlying component |
 
 
 #### Delete the binary file
 ##### Request
-DELETE `http://localhost:{daprPort}/v1.0-alpha1/state/binarystore/{componentName}/{fileName}`
+DELETE `http://localhost:{daprPort}/v1.0-alpha1/binarystore/{componentName}/{fileName}`
 
 ##### Response
 | Code | Description |
 | ---- | ---- |
 | 204 | Indicates the delete operation completed successfully |
-| 400 | File store provider not found |
+| 400 | Binary store component not found or file name is invalid |
 | 404 | File not found |
 | 500 | Request formatted correctly, but error in Dapr code or underlying component |
 
@@ -298,7 +356,6 @@ the release that warrant inclusion (though ideally not because of a nice-to-have
 sink issues, but must-have). Here are a few such proposals:
 
 1) Etags/Conditional writes
-2) Optional filename prefix
 
 ### Why doesn't it support [awesome-feature-X]?
 This is intended as a provider-agnostic, lean building block that provides a simple mechanism to store binary data
@@ -308,8 +365,8 @@ I leave it to the architects of future even more specialized state store buildin
 support additional features beyond what's provided beyond this narrow implementation.
 
 ## Completion Checklist
-- [ ] File Store Runtime Implementation
-- [ ] Tests added (e2e, unit)
-- [ ] Implement File Store providers
+- [x] Binary Store Runtime Implementation
+- [x] Tests added (integration, unit and component conformance)
+- [x] Implement initial Binary Store providers
 - [ ] SDK Support
 - [ ] Documentation (supported providers, purpose, set up documentation structure for speciality state stores)
